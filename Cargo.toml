@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "pallets/wwc-token",
+    "pallets/wwc-storage",
 ]
 
 [workspace.package]
