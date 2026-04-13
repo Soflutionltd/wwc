@@ -25,6 +25,8 @@ pub mod pallet {
     pub const REWARD_VALIDATOR_DAILY: u128 = 50;
     pub const MIN_BENCHMARK_GAIN: u8 = 1; // percent
     pub const REQUIRED_VALIDATIONS: u32 = 3;
+    pub const BASE_REWARD: u128 = 100; // initial reward at launch
+    pub const HALVING_CONSTANT: u128 = 10; // sqrt divisor base
 
     #[pallet::pallet]
     pub struct Pallet<T>(_);
@@ -41,6 +43,16 @@ pub mod pallet {
     #[pallet::storage]
     #[pallet::getter(fn total_supply)]
     pub type TotalSupply<T> = StorageValue<_, u128, ValueQuery>;
+
+    /// Number of active miners (contributors who submitted in last 30 days)
+    #[pallet::storage]
+    #[pallet::getter(fn active_miners)]
+    pub type ActiveMiners<T> = StorageValue<_, u64, ValueQuery>;
+
+    /// Total contributions processed (for halving calculation)
+    #[pallet::storage]
+    #[pallet::getter(fn total_contributions)]
+    pub type TotalContributions<T> = StorageValue<_, u64, ValueQuery>;
 
     /// Balance of each account
     #[pallet::storage]
@@ -273,15 +285,45 @@ pub mod pallet {
 
     // ── Internal functions ───────────────────────────────────────────
     impl<T: Config> Pallet<T> {
+        /// Calculate degressive reward based on number of active miners.
+        /// Formula: BASE_REWARD / sqrt(active_miners / HALVING_CONSTANT)
+        /// At 100 miners: 100 / sqrt(10) = ~31.6 WWC
+        /// At 1,000 miners: 100 / sqrt(100) = 10 WWC
+        /// At 10,000 miners: 100 / sqrt(1000) = ~3.16 WWC
+        /// At 100,000 miners: 100 / sqrt(10000) = 1 WWC
+        /// Minimum reward: 1 WWC (never zero)
+        fn calculate_reward() -> u128 {
+            let miners = ActiveMiners::<T>::get();
+            if miners <= HALVING_CONSTANT as u64 {
+                return BASE_REWARD; // Early days: full reward
+            }
+            // Integer sqrt approximation: BASE_REWARD / sqrt(miners / HALVING_CONSTANT)
+            let ratio = miners / HALVING_CONSTANT as u64;
+            let sqrt_ratio = (ratio as f64).sqrt() as u128;
+            let reward = BASE_REWARD / sp_std::cmp::max(sqrt_ratio, 1);
+            sp_std::cmp::max(reward, 1) // Never less than 1 WWC
+        }
+
         /// Mint new WWC tokens. This is the ONLY way tokens are created.
         /// There is no public mint function. Only the pallet logic can call this.
+        /// Amount is auto-adjusted by the degressive reward algorithm.
         fn mint(to: T::AccountId, amount: u128, contribution_type: ContributionType) {
-            Balances::<T>::mutate(&to, |b| *b += amount);
-            TotalSupply::<T>::mutate(|s| *s += amount);
+            // Apply degressive factor to the reward
+            let adjusted = if amount == REWARD_LORA_IMPROVEMENT {
+                calculate_reward()
+            } else {
+                // Validators get proportional reduction
+                let factor = calculate_reward() * 100 / BASE_REWARD;
+                sp_std::cmp::max(amount * factor / 100, 1)
+            };
+
+            Balances::<T>::mutate(&to, |b| *b += adjusted);
+            TotalSupply::<T>::mutate(|s| *s += adjusted);
+            TotalContributions::<T>::mutate(|c| *c += 1);
 
             Self::deposit_event(Event::RewardMinted {
                 contributor: to,
-                amount,
+                amount: adjusted,
                 contribution_type,
             });
         }
