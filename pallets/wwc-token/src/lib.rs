@@ -4,10 +4,15 @@
 //! Every token represents verified machine work. Zero human control.
 //!
 //! ## Immutable rules (enforced by code, no admin override):
-//! - 100 WWC per validated LoRA improvement (benchmark >= +1%)
-//! - 10 WWC per validated benchmark submission
-//! - 50 WWC per active validator node per day
+//! - Rewards are degressive: BASE_REWARD / sqrt(active_miners / 10)
+//! - 10% of every reward is burned (deflationary pressure)
+//! - Requires 3 independent validators with staking
 //! - 0 WWC from any other source (no mint function, no owner)
+//!
+//! ## NON-UPGRADABLE PALLET
+//! This pallet's logic MUST NOT be modified by runtime upgrades.
+//! The blockchain (infrastructure) is upgradable by governance.
+//! The monetary rules (this pallet) are immutable forever.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -27,6 +32,9 @@ pub mod pallet {
     pub const REQUIRED_VALIDATIONS: u32 = 3;
     pub const BASE_REWARD: u128 = 100; // initial reward at launch
     pub const HALVING_CONSTANT: u128 = 10; // sqrt divisor base
+    pub const BURN_RATE_PERCENT: u128 = 10; // 10% of every reward is burned
+    pub const MIN_STAKE_AMOUNT: u128 = 100; // min WWC to stake as validator
+    pub const SLASH_PERCENT: u128 = 50; // 50% of stake slashed on bad validation
 
     #[pallet::pallet]
     pub struct Pallet<T>(_);
@@ -44,6 +52,14 @@ pub mod pallet {
     #[pallet::getter(fn total_supply)]
     pub type TotalSupply<T> = StorageValue<_, u128, ValueQuery>;
 
+    /// Total WWC burned (deflationary counter)
+    #[pallet::storage]
+    #[pallet::getter(fn total_burned)]
+    pub type TotalBurned<T> = StorageValue<_, u128, ValueQuery>;
+
+    /// Circulating supply = total_supply - total_burned
+    /// (computed on-the-fly, not stored)
+
     /// Number of active miners (contributors who submitted in last 30 days)
     #[pallet::storage]
     #[pallet::getter(fn active_miners)]
@@ -58,6 +74,13 @@ pub mod pallet {
     #[pallet::storage]
     #[pallet::getter(fn balance_of)]
     pub type Balances<T: Config> = StorageMap<
+        _, Blake2_128Concat, T::AccountId, u128, ValueQuery
+    >;
+
+    /// Staked balance of validators (locked, cannot transfer while staked)
+    #[pallet::storage]
+    #[pallet::getter(fn staked_balance)]
+    pub type StakedBalances<T: Config> = StorageMap<
         _, Blake2_128Concat, T::AccountId, u128, ValueQuery
     >;
 
@@ -95,7 +118,28 @@ pub mod pallet {
         RewardMinted {
             contributor: T::AccountId,
             amount: u128,
+            burned: u128,
             contribution_type: ContributionType,
+        },
+        /// Tokens burned (deflationary)
+        TokensBurned {
+            amount: u128,
+            total_burned: u128,
+        },
+        /// Validator staked tokens
+        ValidatorStaked {
+            validator: T::AccountId,
+            amount: u128,
+        },
+        /// Validator unstaked tokens
+        ValidatorUnstaked {
+            validator: T::AccountId,
+            amount: u128,
+        },
+        /// Validator slashed for bad validation
+        ValidatorSlashed {
+            validator: T::AccountId,
+            amount_slashed: u128,
         },
         /// Transfer between accounts
         Transfer {
@@ -116,20 +160,19 @@ pub mod pallet {
     // ── Errors ──────────────────────────────────────────────────────
     #[pallet::error]
     pub enum Error<T> {
-        /// Benchmark gain is below the minimum threshold
         InsufficientBenchmarkGain,
-        /// This contribution hash already exists
         ContributionAlreadyExists,
-        /// Contribution not found in pending
         ContributionNotFound,
-        /// Validator already validated this contribution
         AlreadyValidated,
-        /// Cannot validate your own contribution
         CannotSelfValidate,
-        /// Insufficient balance for transfer
         InsufficientBalance,
-        /// Validator already rewarded today
         AlreadyRewardedToday,
+        /// Must stake minimum amount to validate
+        InsufficientStake,
+        /// Not enough staked balance to unstake
+        InsufficientStakedBalance,
+        /// Validator is not staked (cannot validate)
+        ValidatorNotStaked,
     }
 
     // ── Extrinsics (callable functions) ──────────────────────────────
@@ -142,8 +185,6 @@ pub mod pallet {
     impl<T: Config> Pallet<T> {
 
         /// Submit a LoRA contribution for validation.
-        /// The contributor provides the hash of the delta and the benchmark gain.
-        /// Requires 3 independent validators to approve before minting.
         #[pallet::call_index(0)]
         #[pallet::weight(10_000)]
         pub fn submit_contribution(
@@ -152,31 +193,15 @@ pub mod pallet {
             benchmark_gain: u8,
         ) -> DispatchResult {
             let submitter = ensure_signed(origin)?;
-
-            ensure!(
-                benchmark_gain >= MIN_BENCHMARK_GAIN,
-                Error::<T>::InsufficientBenchmarkGain
-            );
-            ensure!(
-                !PendingContributions::<T>::contains_key(&contribution_hash),
-                Error::<T>::ContributionAlreadyExists
-            );
-
-            PendingContributions::<T>::insert(
-                &contribution_hash,
-                (submitter.clone(), benchmark_gain, Vec::<T::AccountId>::new()),
-            );
-
-            Self::deposit_event(Event::ContributionSubmitted {
-                submitter,
-                hash: contribution_hash,
-                benchmark_gain,
-            });
+            ensure!(benchmark_gain >= MIN_BENCHMARK_GAIN, Error::<T>::InsufficientBenchmarkGain);
+            ensure!(!PendingContributions::<T>::contains_key(&contribution_hash), Error::<T>::ContributionAlreadyExists);
+            PendingContributions::<T>::insert(&contribution_hash, (submitter.clone(), benchmark_gain, Vec::<T::AccountId>::new()));
+            Self::deposit_event(Event::ContributionSubmitted { submitter, hash: contribution_hash, benchmark_gain });
             Ok(())
         }
 
-        /// Validate a pending contribution. Once 3 validators approve,
-        /// the contributor receives 100 WWC and each validator receives 10 WWC.
+        /// Validate a pending contribution. Requires validator to be staked.
+        /// Once 3 staked validators approve, rewards are minted with 10% burn.
         #[pallet::call_index(1)]
         #[pallet::weight(10_000)]
         pub fn validate_contribution(
@@ -184,57 +209,54 @@ pub mod pallet {
             contribution_hash: [u8; 32],
         ) -> DispatchResult {
             let validator = ensure_signed(origin)?;
+            // Validator must have staked tokens
+            ensure!(StakedBalances::<T>::get(&validator) >= MIN_STAKE_AMOUNT, Error::<T>::ValidatorNotStaked);
 
-            PendingContributions::<T>::try_mutate(
-                &contribution_hash,
-                |maybe| -> DispatchResult {
-                    let (submitter, _gain, validators) =
-                        maybe.as_mut().ok_or(Error::<T>::ContributionNotFound)?;
+            PendingContributions::<T>::try_mutate(&contribution_hash, |maybe| -> DispatchResult {
+                let (submitter, _gain, validators) = maybe.as_mut().ok_or(Error::<T>::ContributionNotFound)?;
+                ensure!(*submitter != validator, Error::<T>::CannotSelfValidate);
+                ensure!(!validators.contains(&validator), Error::<T>::AlreadyValidated);
+                validators.push(validator.clone());
+                Self::deposit_event(Event::ContributionValidated { validator: validator.clone(), hash: contribution_hash });
 
-                    // Cannot validate your own contribution
-                    ensure!(*submitter != validator, Error::<T>::CannotSelfValidate);
-                    // Cannot validate twice
-                    ensure!(
-                        !validators.contains(&validator),
-                        Error::<T>::AlreadyValidated
-                    );
-
-                    validators.push(validator.clone());
-
-                    Self::deposit_event(Event::ContributionValidated {
-                        validator: validator.clone(),
-                        hash: contribution_hash,
-                    });
-
-                    // If we have enough validations, mint rewards
-                    if validators.len() as u32 >= REQUIRED_VALIDATIONS {
-                        // Mint 100 WWC to the contributor
-                        Self::mint(
-                            submitter.clone(),
-                            REWARD_LORA_IMPROVEMENT,
-                            ContributionType::LoraImprovement,
-                        );
-                        // Mint 10 WWC to each validator
-                        for v in validators.iter() {
-                            Self::mint(
-                                v.clone(),
-                                REWARD_BENCHMARK_SUBMISSION,
-                                ContributionType::BenchmarkSubmission,
-                            );
-                        }
+                if validators.len() as u32 >= REQUIRED_VALIDATIONS {
+                    Self::mint_with_burn(submitter.clone(), REWARD_LORA_IMPROVEMENT, ContributionType::LoraImprovement);
+                    for v in validators.iter() {
+                        Self::mint_with_burn(v.clone(), REWARD_BENCHMARK_SUBMISSION, ContributionType::BenchmarkSubmission);
                     }
-                    Ok(())
-                },
-            )?;
+                }
+                Ok(())
+            })?;
 
-            // Clean up if fully validated
-            if let Some((_, _, validators)) =
-                PendingContributions::<T>::get(&contribution_hash)
-            {
+            if let Some((_, _, validators)) = PendingContributions::<T>::get(&contribution_hash) {
                 if validators.len() as u32 >= REQUIRED_VALIDATIONS {
                     PendingContributions::<T>::remove(&contribution_hash);
                 }
             }
+            Ok(())
+        }
+
+        /// Stake tokens to become a validator. Staked tokens are locked.
+        #[pallet::call_index(4)]
+        #[pallet::weight(10_000)]
+        pub fn stake(origin: OriginFor<T>, amount: u128) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(Balances::<T>::get(&who) >= amount, Error::<T>::InsufficientBalance);
+            Balances::<T>::mutate(&who, |b| *b -= amount);
+            StakedBalances::<T>::mutate(&who, |s| *s += amount);
+            Self::deposit_event(Event::ValidatorStaked { validator: who, amount });
+            Ok(())
+        }
+
+        /// Unstake tokens. Returns them to transferable balance.
+        #[pallet::call_index(5)]
+        #[pallet::weight(10_000)]
+        pub fn unstake(origin: OriginFor<T>, amount: u128) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(StakedBalances::<T>::get(&who) >= amount, Error::<T>::InsufficientStakedBalance);
+            StakedBalances::<T>::mutate(&who, |s| *s -= amount);
+            Balances::<T>::mutate(&who, |b| *b += amount);
+            Self::deposit_event(Event::ValidatorUnstaked { validator: who, amount });
             Ok(())
         }
 
@@ -286,46 +308,64 @@ pub mod pallet {
     // ── Internal functions ───────────────────────────────────────────
     impl<T: Config> Pallet<T> {
         /// Calculate degressive reward based on number of active miners.
-        /// Formula: BASE_REWARD / sqrt(active_miners / HALVING_CONSTANT)
-        /// At 100 miners: 100 / sqrt(10) = ~31.6 WWC
-        /// At 1,000 miners: 100 / sqrt(100) = 10 WWC
-        /// At 10,000 miners: 100 / sqrt(1000) = ~3.16 WWC
-        /// At 100,000 miners: 100 / sqrt(10000) = 1 WWC
-        /// Minimum reward: 1 WWC (never zero)
         fn calculate_reward() -> u128 {
             let miners = ActiveMiners::<T>::get();
             if miners <= HALVING_CONSTANT as u64 {
-                return BASE_REWARD; // Early days: full reward
+                return BASE_REWARD;
             }
-            // Integer sqrt approximation: BASE_REWARD / sqrt(miners / HALVING_CONSTANT)
             let ratio = miners / HALVING_CONSTANT as u64;
             let sqrt_ratio = (ratio as f64).sqrt() as u128;
             let reward = BASE_REWARD / sp_std::cmp::max(sqrt_ratio, 1);
-            sp_std::cmp::max(reward, 1) // Never less than 1 WWC
+            sp_std::cmp::max(reward, 1)
         }
 
-        /// Mint new WWC tokens. This is the ONLY way tokens are created.
-        /// There is no public mint function. Only the pallet logic can call this.
-        /// Amount is auto-adjusted by the degressive reward algorithm.
-        fn mint(to: T::AccountId, amount: u128, contribution_type: ContributionType) {
-            // Apply degressive factor to the reward
+        /// Mint new WWC tokens with automatic 10% burn.
+        /// This is the ONLY way tokens are created. No public mint function.
+        fn mint_with_burn(to: T::AccountId, amount: u128, contribution_type: ContributionType) {
             let adjusted = if amount == REWARD_LORA_IMPROVEMENT {
-                calculate_reward()
+                Self::calculate_reward()
             } else {
-                // Validators get proportional reduction
-                let factor = calculate_reward() * 100 / BASE_REWARD;
+                let factor = Self::calculate_reward() * 100 / BASE_REWARD;
                 sp_std::cmp::max(amount * factor / 100, 1)
             };
 
-            Balances::<T>::mutate(&to, |b| *b += adjusted);
-            TotalSupply::<T>::mutate(|s| *s += adjusted);
+            // Calculate burn: 10% of reward is destroyed
+            let burn_amount = adjusted * BURN_RATE_PERCENT / 100;
+            let net_reward = adjusted - burn_amount;
+
+            // Mint net reward to recipient
+            Balances::<T>::mutate(&to, |b| *b += net_reward);
+            TotalSupply::<T>::mutate(|s| *s += adjusted); // Total minted includes burned
+            TotalBurned::<T>::mutate(|b| *b += burn_amount);
             TotalContributions::<T>::mutate(|c| *c += 1);
 
             Self::deposit_event(Event::RewardMinted {
-                contributor: to,
-                amount: adjusted,
-                contribution_type,
+                contributor: to, amount: net_reward, burned: burn_amount, contribution_type,
             });
+            if burn_amount > 0 {
+                Self::deposit_event(Event::TokensBurned {
+                    amount: burn_amount, total_burned: TotalBurned::<T>::get(),
+                });
+            }
+        }
+
+        /// Slash a validator's stake. Called when a validation is disputed.
+        /// Burns the slashed amount (removed from circulation permanently).
+        pub fn slash_validator(validator: &T::AccountId) {
+            let staked = StakedBalances::<T>::get(validator);
+            let slash_amount = staked * SLASH_PERCENT / 100;
+            if slash_amount > 0 {
+                StakedBalances::<T>::mutate(validator, |s| *s -= slash_amount);
+                TotalBurned::<T>::mutate(|b| *b += slash_amount);
+                Self::deposit_event(Event::ValidatorSlashed {
+                    validator: validator.clone(), amount_slashed: slash_amount,
+                });
+            }
+        }
+
+        /// Get circulating supply (total minted minus total burned)
+        pub fn circulating_supply() -> u128 {
+            TotalSupply::<T>::get().saturating_sub(TotalBurned::<T>::get())
         }
     }
 
