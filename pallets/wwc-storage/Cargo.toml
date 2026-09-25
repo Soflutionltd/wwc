@@ -11,7 +11,7 @@ repository = "https://github.com/Soflution1/wwc"
 codec = { package = "parity-scale-codec", version = "3.6", default-features = false, features = ["derive"] }
 scale-info = { version = "2.11", default-features = false, features = ["derive"] }
 frame-support = { version = "38.0", default-features = false }
-frame-system = { version = "38.0", default-features = false }
+frame-system = { version = "48.0", default-features = false }
 sp-std = { version = "14.0", default-features = false }
 sp-runtime = { version = "39.0", default-features = false }
 
